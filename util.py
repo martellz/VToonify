@@ -209,7 +209,7 @@ def get_crop_parameter_by_mediapipe(img, padding=[200, 200, 200, 200]):
     else:
         return None
 
-def creat_weight_kernel(kernel_size=(3, 3), sigma=1, k=1):
+def creat_weight_kernel(kernel_size=(3, 3), a=0.8, b = 1.0, k=1):
     # if sigma == 0:
     #     sigma = ((kernel_size - 1) * 0.5 - 1) * 0.3 + 0.8
     X = np.linspace(-k, k, kernel_size[0])
@@ -221,13 +221,23 @@ def creat_weight_kernel(kernel_size=(3, 3), sigma=1, k=1):
 
     distance = np.where(np.abs(x - x0) > np.abs(y - y0), np.abs(x - x0), np.abs(y - y0))    # from 0 to 1
 
-    a = 0.8
-    kernel = np.where(distance > a, (1 - distance) / (1 - a), 1)
+    kernel = np.where(distance > a, (b - distance) / (b - a), 1)
+    kernel = np.where(kernel < 0, 0, kernel)
 
     # kernel = (1 - distance) ** 1.5
     # kernel = (kernel - kernel.min()) / kernel.max()
 
     return kernel
+
+def create_weight_field(mask: np.ndarray, kernel_size=(3, 3), iterations: int=10, a: float=2):
+    origin = mask.copy()
+    if origin.max() > 1:
+        origin = origin / 255.
+
+    temp = origin
+    for _ in range(iterations):
+        temp = (cv2.erode(temp, np.ones(kernel_size)) + temp) / 2
+    return temp / temp.max()
 
 def tensor2cv2(img):
     tmp = ((img.cpu().numpy().transpose(1, 2, 0) + 1.0) * 127.5).astype(np.uint8)

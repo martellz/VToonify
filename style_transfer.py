@@ -11,10 +11,12 @@ from tqdm import tqdm
 from model.vtoonify import VToonify
 from model.bisenet.model import BiSeNet
 from model.encoder.align_all_parallel import align_face
-from util import save_image, load_image, visualize, load_psp_standalone, get_video_crop_parameter, tensor2cv2, get_crop_parameter_by_mediapipe, creat_weight_kernel
+from util import save_image, load_image, visualize, load_psp_standalone, get_video_crop_parameter, tensor2cv2, get_crop_parameter_by_mediapipe, creat_weight_kernel, create_weight_field
 import matplotlib.pyplot as plt
 from typing import Union, Optional, List, Dict
 from model.encoder.encoders.psp_encoders import GradualStyleEncoder
+from server_config import config
+from matting.rembg_simplify import remove
 import time
 
 class TestOptions():
@@ -112,6 +114,11 @@ def image_style_transfer_d(
         transforms.Normalize(mean=[0.5, 0.5, 0.5],std=[0.5,0.5,0.5]),
         ])
 
+    # resize, longest edge of frame is resized to 1080
+    H, W = frame.shape[:2]
+    if max(H, W) > 1080:
+        ratio = 1080 / max(H, W)
+        frame = cv2.resize(frame, (round(W * ratio), round(H * ratio)))
     origin = frame.copy()
 
     # We detect the face in the image, and resize the image so that the eye distance is 64 pixels.
@@ -120,14 +127,9 @@ def image_style_transfer_d(
     paras = get_crop_parameter_by_mediapipe(frame, padding)
     if paras is not None:
         h,w,top,bottom,left,right,scale = paras
-        kernel_1d = np.array([[0.125],[0.375],[0.375],[0.125]])
         # for HR image, we apply gaussian blur to it to avoid over-sharp stylization results
-        print("scale = ", scale)
-        if scale <= 0.75:
-            frame = cv2.sepFilter2D(frame, -1, kernel_1d, kernel_1d)
-        if scale <= 0.375:
-            frame = cv2.sepFilter2D(frame, -1, kernel_1d, kernel_1d)
         frame = cv2.resize(frame[top:bottom, left:right], (w, h))
+        frame = cv2.GaussianBlur(frame, (3, 3), 0)
     else:
         return None
 
@@ -154,22 +156,63 @@ def image_style_transfer_d(
         y_tilde = vtoonify(inputs, s_w.repeat(inputs.size(0), 1, 1), d_s = 0.5)        
         y_tilde = torch.clamp(y_tilde, -1, 1)
 
+    t = time.time()
+    save_dir = config['save_dir']
+
     if paras is not None:
+        print(paras)
+
         h,w,top,bottom,left,right,scale = paras
         origin = origin / 255.
         output = (y_tilde[0].detach().cpu().numpy().transpose(1, 2, 0) + 1) * 0.5
         output = cv2.resize(output, (right - left, bottom - top))
-        weight_kernel = (creat_weight_kernel((right - left, bottom - top)))[..., np.newaxis]
-        origin[top:bottom, left:right] = output * weight_kernel + origin[top:bottom, left:right] * (1 - weight_kernel)
+
+        # original blending method
+        # weight_kernel = (creat_weight_kernel((right - left, bottom - top), 0.5, 0.8))[..., np.newaxis]
+        # origin[top:bottom, left:right] = output * weight_kernel + origin[top:bottom, left:right] * (1 - weight_kernel)
+
         origin = (origin * 255).astype(np.uint8)
+        output = (output * 255).astype(np.uint8)
 
-        save_dir = '~/Pictures/test2333'
+        # seamlessClone the output region directly, not good enough and background in output region is blurry
+        # mask = 255 * np.ones(output.shape, output.dtype)
+        # center = (int((left + right) / 2), int((top + bottom) / 2))
+        # blend = cv2.seamlessClone(output, origin, mask, center, cv2.NORMAL_CLONE)
+
+        # matte the human part and do blending
+        mask_output = remove(output, only_mask=True)
+        mask_origin = remove(origin, only_mask=True)
+        mask2 = np.where((mask_output + mask_origin[top:bottom, left:right]) > 10, 255 * np.ones_like(mask_output), np.zeros_like(mask_output))
+
+        # the hair part changes a lot and face part may shrink, so I dilate the mask
+        mask2 = cv2.dilate(mask2, np.ones((10, 10), np.uint8), iterations = 10)
+
+        # do the boundRect to get corrent center, because:
+        # seamlessClone will do boundRect crop and place the cropped source image on the destination image,
+        # where the Point p is the center of the cropped source (after margin removal) - and not the center of the original source.
+        # see https://github.com/opencv/opencv/issues/21902
+        x, y, rect_w, rect_h = cv2.boundingRect(mask2)
+        center2 = (int(left + x + rect_w / 2), int(top + y + rect_h / 2))
+        origin_blur = cv2.GaussianBlur(origin, (7, 7), 0)   # I have to do gaussian blur because background of output region is much more blur than origin
+        blend2 = cv2.seamlessClone(output, origin_blur, mask2, center2, cv2.NORMAL_CLONE)
+
+        # smooth the edge region of mask
+        weight = np.zeros_like(blend2)[..., 0]
+        weight[top:bottom, left:right] = mask2
+        weight_field = create_weight_field(weight, kernel_size=(5, 5), iterations=30, a=1.1)
+        if len(weight_field.shape) == 2:
+            weight_field = weight_field[..., np.newaxis]
+        blend2 = (blend2 / 255.) * weight_field + (origin_blur / 255.) * (1 - weight_field)
+        blend2 = (blend2 * 255).astype(np.uint8)
+
         if os.path.exists(save_dir):
-            t = time.time()
-            cv2.imwrite(save_dir + '/{}_vt_d.jpg'.format(t), (output * 255).astype(np.uint8)[..., [2, 1, 0]])
-            cv2.imwrite(save_dir + '/{}_blend.jpg'.format(t), origin[..., [2, 1, 0]])
+            cv2.imwrite(save_dir + '/{}_weight_field.jpg'.format(t), (255 * weight_field).astype(np.uint8))
+            cv2.imwrite(save_dir + '/{}_input.jpg'.format(t), frame[..., [2, 1, 0]])
+            cv2.imwrite(save_dir + '/{}_vt_d.jpg'.format(t), output[..., [2, 1, 0]])
+            # cv2.imwrite(save_dir + '/{}_blend.jpg'.format(t), blend[..., [2, 1, 0]])
+            cv2.imwrite(save_dir + '/{}_blend2.jpg'.format(t), blend2[..., [2, 1, 0]])
 
-        return origin
+        return blend2
 
     
 if __name__ == "__main__":
