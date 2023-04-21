@@ -3,7 +3,6 @@ import os
 import argparse
 import numpy as np
 import cv2
-import dlib
 import torch
 from torchvision import transforms
 import torch.nn.functional as F
@@ -11,12 +10,12 @@ from tqdm import tqdm
 from model.vtoonify import VToonify
 from model.bisenet.model import BiSeNet
 from model.encoder.align_all_parallel import align_face
-from util import save_image, load_image, visualize, load_psp_standalone, get_video_crop_parameter, tensor2cv2, get_crop_parameter_by_mediapipe, creat_weight_kernel, create_weight_field
+from util import save_image, load_psp_standalone, get_video_crop_parameter, tensor2cv2, get_crop_parameter_by_mediapipe, creat_weight_kernel, create_weight_field
 import matplotlib.pyplot as plt
-from typing import Union, Optional, List, Dict
+from typing import Optional, List, Tuple
 from model.encoder.encoders.psp_encoders import GradualStyleEncoder
-from server_config import config
 from matting.rembg_simplify import remove
+from mediapipe.python.solutions.face_detection import FaceDetection
 import time
 
 class TestOptions():
@@ -50,19 +49,25 @@ class TestOptions():
             print('%s: %s' % (str(name), str(value)))
         return self.opt
     
-def create_image_style_transfer_dualstylegan_models(ckpt = './checkpoint/vtoonify_d_cartoon_test/vtoonify_s100_d0.5.pt', style_id: int = 100, device: str = 'cuda'):
-    print('loading ckpt ', ckpt)
+def create_image_style_transfer_dualstylegan_models(
+        style_id: int = 299,
+        device: str = 'cuda',
+        ckpt: str = './checkpoint/vtoonify_d_cartoon/vtoonify_s299_d0.5.pt',
+        faceparsing_ckpt: str = './checkpoint/faceparsing.pth',
+        pspencoder_ckpt: str = './checkpoint/encoder.pt',
+        exstyle_path: str = './checkpoint/vtoonify_d_cartoon/exstyle_code.npy',    # usually in the same dir with ckpt
+        ):
     vtoonify = VToonify(backbone = 'dualstylegan')
+    print('loading ckpt: {}'.format(ckpt))
     vtoonify.load_state_dict(torch.load(ckpt, map_location=lambda storage, loc: storage)['g_ema'])
     vtoonify.to(device)
 
     parsingpredictor = BiSeNet(n_classes=19)
-    parsingpredictor.load_state_dict(torch.load('./checkpoint/faceparsing.pth', map_location=lambda storage, loc: storage))
+    parsingpredictor.load_state_dict(torch.load(faceparsing_ckpt, map_location=lambda storage, loc: storage))
     parsingpredictor.to(device).eval()
 
-    pspencoder = load_psp_standalone('./checkpoint/encoder.pt', device)    
+    pspencoder = load_psp_standalone(pspencoder_ckpt, device)
 
-    exstyle_path = os.path.join(os.path.dirname(ckpt), 'exstyle_code.npy')
     exstyles = np.load(exstyle_path, allow_pickle='TRUE').item()
     stylename = list(exstyles.keys())[style_id]
     exstyle = torch.tensor(exstyles[stylename]).to(device)
@@ -71,148 +76,110 @@ def create_image_style_transfer_dualstylegan_models(ckpt = './checkpoint/vtoonif
 
     return vtoonify, parsingpredictor, pspencoder, exstyle
 
-def image_style_transfer_d(
+def image_style_transfer_dualstylegan(
     frame: np.ndarray,
     style_id: int = 299,
     device: str = 'cuda',
-    padding: Union[int, List[int]] = [120, 120, 120, 120], 
-    ckpt: Optional[str] = './checkpoint/vtoonify_d_cartoon/vtoonify_s299_d0.5.pt',
-    vtoonify: Optional[VToonify] = None,
-    parsingpredictor: Optional[BiSeNet] = None,
-    pspencoder: Optional[GradualStyleEncoder] = None,
-    exstyle = None,
-):
-    if vtoonify is None:
-        if ckpt is None:
-            print('at least one of ckpt and vtoonify model should not be None!')
-            exit(1)
-        vtoonify = VToonify(backbone = 'dualstylegan')
-        vtoonify.load_state_dict(torch.load(ckpt, map_location=lambda storage, loc: storage)['g_ema'])
-    vtoonify.to(device)
-
-    if parsingpredictor is None:
-        parsingpredictor = BiSeNet(n_classes=19)
-        parsingpredictor.load_state_dict(torch.load('./checkpoint/faceparsing.pth', map_location=lambda storage, loc: storage))
-    parsingpredictor.to(device).eval()
-
-    if pspencoder is None:
-        pspencoder = load_psp_standalone('./checkpoint/encoder.pt', device)    
-
-    if exstyle is None:
-        if ckpt is None:
-            print('at least one of ckpt and exstyle should not be None!')
-            exit(1)
-        exstyle_path = os.path.join(os.path.dirname(ckpt), 'exstyle_code.npy')
-        exstyles = np.load(exstyle_path, allow_pickle='TRUE').item()
-        stylename = list(exstyles.keys())[style_id]
-        exstyle = torch.tensor(exstyles[stylename]).to(device)
-        with torch.no_grad():  
-            exstyle = vtoonify.zplus2wplus(exstyle)
+    padding: List[int] = [120, 120, 120, 120],
+    faceDetector: Optional[FaceDetection] = None,
+    models: Optional[Tuple[VToonify, BiSeNet, GradualStyleEncoder, torch.Tensor]] = None,
+) -> Optional[np.ndarray]:
+    if models is None:
+        vtoonify, parsingpredictor, pspencoder, exstyle = create_image_style_transfer_dualstylegan_models(style_id, device)
+    else:
+        vtoonify, parsingpredictor, pspencoder, exstyle = models
 
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5],std=[0.5,0.5,0.5]),
         ])
 
-    # resize, longest edge of frame is resized to 1080
+    # resize, longest edge of frame is not greater than 1k
     H, W = frame.shape[:2]
-    if max(H, W) > 1080:
-        ratio = 1080 / max(H, W)
+    if max(H, W) > 1024:
+        ratio = 1024 / max(H, W)
         frame = cv2.resize(frame, (round(W * ratio), round(H * ratio)))
     origin = frame.copy()
 
     # We detect the face in the image, and resize the image so that the eye distance is 64 pixels.
-    if padding is int:
-        padding = [padding for _ in range(4)]
-    paras = get_crop_parameter_by_mediapipe(frame, padding)
-    if paras is not None:
-        h,w,top,bottom,left,right,scale = paras
-        # for HR image, we apply gaussian blur to it to avoid over-sharp stylization results
-        frame = cv2.resize(frame[top:bottom, left:right], (w, h))
-        frame = cv2.GaussianBlur(frame, (3, 3), 0)
-    else:
+    if faceDetector is None:
+        faceDetector = FaceDetection(min_detection_confidence=0.5)
+    crop_paras = get_crop_parameter_by_mediapipe(frame, faceDetector, padding)
+
+    if crop_paras is None:
         return None
+    else:
+        h,w,top,bottom,left,right = crop_paras
+        frame = cv2.resize(frame[top:bottom, left:right], (w, h))
 
-    with torch.no_grad():
+        # we apply gaussian blur to it to avoid over-sharp stylization results
+        frame = cv2.GaussianBlur(frame, (3, 3), 0)
 
-        I = transform(frame).unsqueeze(dim=0).to(device)
-        s_w = pspencoder(I)
-        s_w = vtoonify.zplus2wplus(s_w)
-        if vtoonify.backbone == 'dualstylegan':
-            # if args.color_transfer:
-            #     s_w = exstyle
-            # else:
-            s_w[:,:7] = exstyle[:,:7]
+        with torch.no_grad():
+            I = transform(frame).unsqueeze(dim=0).to(device)
+            s_w = pspencoder(I)
+            s_w = vtoonify.zplus2wplus(s_w)
+            if vtoonify.backbone == 'dualstylegan':
+                s_w[:,:7] = exstyle[:,:7]
 
-        x = transform(frame).unsqueeze(dim=0).to(device)
-        # parsing network works best on 512x512 images, so we predict parsing maps on upsmapled frames
-        # followed by downsampling the parsing maps
-        x_p = F.interpolate(parsingpredictor(2*(F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)))[0], 
-                            scale_factor=0.5, recompute_scale_factor=False).detach()
-        torch.cuda.empty_cache()
-        # we give parsing maps lower weight (1/16)
-        inputs = torch.cat((x, x_p/16.), dim=1)
-        # d_s has no effect when backbone is toonify
-        y_tilde = vtoonify(inputs, s_w.repeat(inputs.size(0), 1, 1), d_s = 0.5)        
-        y_tilde = torch.clamp(y_tilde, -1, 1)
+            x = transform(frame).unsqueeze(dim=0).to(device)
+            # parsing network works best on 512x512 images, so we predict parsing maps on upsmapled frames
+            # followed by downsampling the parsing maps
+            x_p = F.interpolate(parsingpredictor(2*(F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)))[0],
+                                scale_factor=0.5, recompute_scale_factor=False).detach()
+            torch.cuda.empty_cache()
+            # we give parsing maps lower weight (1/16)
+            inputs = torch.cat((x, x_p/16.), dim=1)
+            # d_s has no effect when backbone is toonify
+            y_tilde = vtoonify(inputs, s_w.repeat(inputs.size(0), 1, 1), d_s = 0.5)
+            y_tilde = torch.clamp(y_tilde, -1, 1)
 
-    t = time.time()
-    save_dir = config['save_dir']
-
-    if paras is not None:
-        print(paras)
-
-        h,w,top,bottom,left,right,scale = paras
-        origin = origin / 255.
         output = (y_tilde[0].detach().cpu().numpy().transpose(1, 2, 0) + 1) * 0.5
-        output = cv2.resize(output, (right - left, bottom - top))
+        blend = blending(origin, output, top, bottom, left, right)
+        return blend
 
-        # original blending method
-        # weight_kernel = (creat_weight_kernel((right - left, bottom - top), 0.5, 0.8))[..., np.newaxis]
-        # origin[top:bottom, left:right] = output * weight_kernel + origin[top:bottom, left:right] * (1 - weight_kernel)
-
+def blending(origin: np.ndarray, output: np.ndarray, top: int, bottom: int, left: int, right: int):
+    output = cv2.resize(output, (right - left, bottom - top))
+    if origin.max() <= 1:
         origin = (origin * 255).astype(np.uint8)
+    if output.max() <= 1:
         output = (output * 255).astype(np.uint8)
 
-        # seamlessClone the output region directly, not good enough and background in output region is blurry
-        # mask = 255 * np.ones(output.shape, output.dtype)
-        # center = (int((left + right) / 2), int((top + bottom) / 2))
-        # blend = cv2.seamlessClone(output, origin, mask, center, cv2.NORMAL_CLONE)
+    # matte the human part and do blending
+    mask_output = remove(output, only_mask=True)
+    mask_origin = remove(origin, only_mask=True)
+    mask = np.where((mask_output + mask_origin[top:bottom, left:right]) > 10, 255 * np.ones_like(mask_output), np.zeros_like(mask_output))
 
-        # matte the human part and do blending
-        mask_output = remove(output, only_mask=True)
-        mask_origin = remove(origin, only_mask=True)
-        mask2 = np.where((mask_output + mask_origin[top:bottom, left:right]) > 10, 255 * np.ones_like(mask_output), np.zeros_like(mask_output))
+    # the hair part changes a lot and face part may shrink, so I dilate the mask
+    mask = cv2.dilate(mask, np.ones((10, 10), np.uint8), iterations = 10)
 
-        # the hair part changes a lot and face part may shrink, so I dilate the mask
-        mask2 = cv2.dilate(mask2, np.ones((10, 10), np.uint8), iterations = 10)
+    # do the boundRect to get corrent center, because:
+    # seamlessClone will do boundRect crop and place the cropped source image on the destination image,
+    # where the Point p is the center of the cropped source (after margin removal) - and not the center of the original source.
+    # see https://github.com/opencv/opencv/issues/21902
+    x, y, rect_w, rect_h = cv2.boundingRect(mask)
+    center = (int(left + x + rect_w / 2), int(top + y + rect_h / 2))
 
-        # do the boundRect to get corrent center, because:
-        # seamlessClone will do boundRect crop and place the cropped source image on the destination image,
-        # where the Point p is the center of the cropped source (after margin removal) - and not the center of the original source.
-        # see https://github.com/opencv/opencv/issues/21902
-        x, y, rect_w, rect_h = cv2.boundingRect(mask2)
-        center2 = (int(left + x + rect_w / 2), int(top + y + rect_h / 2))
-        origin_blur = cv2.GaussianBlur(origin, (7, 7), 0)   # I have to do gaussian blur because background of output region is much more blur than origin
-        blend2 = cv2.seamlessClone(output, origin_blur, mask2, center2, cv2.NORMAL_CLONE)
+    # we apply gaussian blur to origin by its max edge
+    # I have to do gaussian blur because background of output region is much more blur than origin
+    origin_max_edge = max(*origin.shape[:2])
+    if origin_max_edge > 768:
+        origin_blur = cv2.GaussianBlur(origin, (5, 5), 0)
+    elif origin_max_edge > 512:
+        origin_blur = cv2.GaussianBlur(origin, (3, 3), 0)
+    else:
+        origin_blur = origin.copy()
 
-        # smooth the edge region of mask
-        weight = np.zeros_like(blend2)[..., 0]
-        weight[top:bottom, left:right] = mask2
-        weight_field = create_weight_field(weight, kernel_size=(5, 5), iterations=30, a=1.1)
-        if len(weight_field.shape) == 2:
-            weight_field = weight_field[..., np.newaxis]
-        blend2 = (blend2 / 255.) * weight_field + (origin_blur / 255.) * (1 - weight_field)
-        blend2 = (blend2 * 255).astype(np.uint8)
+    blend = cv2.seamlessClone(output, origin_blur, mask, center, cv2.NORMAL_CLONE)
 
-        if os.path.exists(save_dir):
-            cv2.imwrite(save_dir + '/{}_weight_field.jpg'.format(t), (255 * weight_field).astype(np.uint8))
-            cv2.imwrite(save_dir + '/{}_input.jpg'.format(t), frame[..., [2, 1, 0]])
-            cv2.imwrite(save_dir + '/{}_vt_d.jpg'.format(t), output[..., [2, 1, 0]])
-            # cv2.imwrite(save_dir + '/{}_blend.jpg'.format(t), blend[..., [2, 1, 0]])
-            cv2.imwrite(save_dir + '/{}_blend2.jpg'.format(t), blend2[..., [2, 1, 0]])
-
-        return blend2
+    # smooth the edge region of mask
+    weight = np.zeros_like(blend)[..., 0]
+    weight[top:bottom, left:right] = mask
+    weight_field = create_weight_field(weight, kernel_size=(5, 5), iterations=30, a=1.1)
+    if len(weight_field.shape) == 2:
+        weight_field = weight_field[..., np.newaxis]
+    blend = (blend / 255.) * weight_field + (origin_blur / 255.) * (1 - weight_field)
+    return (blend * 255).astype(np.uint8)
 
     
 if __name__ == "__main__":

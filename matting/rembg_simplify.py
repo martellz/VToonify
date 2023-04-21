@@ -134,7 +134,7 @@ def new_session(model_name: str = "u2net") -> SimpleSession:
         "u2net",
         ort.InferenceSession(
             str(full_path),
-            providers=ort.get_available_providers(),
+            providers=['CPUExecutionProvider'],
             sess_options=sess_opts,
         ),
     )
