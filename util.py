@@ -14,6 +14,7 @@ import torchvision.transforms as transforms
 from model.stylegan.op_cpu import conv2d_gradfix
 from model.encoder.encoders.psp_encoders import GradualStyleEncoder
 from model.encoder.align_all_parallel import get_landmark
+from mediapipe.python.solutions.face_detection import FaceDetection
     
 def visualize(img_arr, dpi):
     plt.figure(figsize=(10,10),dpi=dpi)
@@ -187,9 +188,7 @@ def get_video_crop_parameter(filepath, predictor, padding=[200,200,200,200]):
     bottom = min(round(center[1] + padding[3]), h) // 8 * 8
     return h,w,top,bottom,left,right,scale
 
-def get_crop_parameter_by_mediapipe(img, padding=[200, 200, 200, 200]):
-    import mediapipe.python.solutions.face_detection as mp_face
-    faceDetection = mp_face.FaceDetection(min_detection_confidence=0.5)
+def get_crop_parameter_by_mediapipe(img: np.ndarray, faceDetection: FaceDetection, padding=[200, 200, 200, 200]):
     results = faceDetection.process(img)
     if results.detections:
         keypoints = results.detections[0].location_data.relative_keypoints
@@ -205,7 +204,7 @@ def get_crop_parameter_by_mediapipe(img, padding=[200, 200, 200, 200]):
         bottom = min(round(center_before_scale[1] + padding[3] // scale), H)
         w = int(scale * (right - left) // 8 * 8)
         h = int(scale * (bottom - top) // 8 * 8)
-        return h,w,top,bottom,left,right,scale
+        return h,w,top,bottom,left,right
     else:
         return None
 

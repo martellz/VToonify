@@ -1,7 +1,7 @@
 {
     "ckpt_dir": "vtoonify_d_cartoon",
     "style_id": 299,
-    "device": "cpu",
-    "padding": 200,
+    "device": "cuda",
+    "padding": 144,
     "save_dir": "/home/zyf/Pictures/test2333"
 }
